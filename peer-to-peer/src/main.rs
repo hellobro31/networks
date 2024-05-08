@@ -1,24 +1,36 @@
 use libp2p::{
     core::upgrade,
     floodsub::{Floodsub, FloodsubEvent, Topic},
-    futures::StreamExt,
     identity,
     mdns::{Mdns, MdnsEvent},
     mplex,
-    noise::{Keypair, NoiseConfig, X25519Spec},
+    noise::{Keypair as NoiseKeypair, NoiseConfig, X25519Spec},
     swarm::{NetworkBehaviourEventProcess, Swarm, SwarmBuilder},
     tcp::TokioTcpConfig,
-    NetworkBehaviour, PeerId, Transport,
+    PeerId, NetworkBehaviour, Transport,
 };
-use log::{error, info};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use tokio::{fs, io::AsyncBufReadExt, sync::mpsc};
+use libp2p::futures::StreamExt;
+use tokio::{
+    fs::File,
+    io::AsyncReadExt,
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+    select,
+    signal,
+};
+use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
+use std::env;
+use tokio::io::AsyncWriteExt;
+use futures_util::sink::SinkExt;
+use std::collections::HashMap;
+use log::{info, error};
+use serde_json;
 
-const STORAGE_FILE_PATH: &str = "./recipes.json";
+const STORAGE_FILE_PATH: &str = "../recipes.json";
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Recipes = Vec<Recipe>;
 
 static KEYS: Lazy<identity::Keypair> = Lazy::new(|| identity::Keypair::generate_ed25519());
@@ -52,11 +64,6 @@ struct ListResponse {
     receiver: String,
 }
 
-enum EventType {
-    Response(ListResponse),
-    Input(String),
-}
-
 #[derive(NetworkBehaviour)]
 struct RecipeBehaviour {
     floodsub: Floodsub,
@@ -65,271 +72,259 @@ struct RecipeBehaviour {
     response_sender: mpsc::UnboundedSender<ListResponse>,
 }
 
+async fn read_local_recipes() -> Result<Recipes> {
+    let path = STORAGE_FILE_PATH; // Ensure this path is set to your 'recipes.json' file
+    let mut file = match File::open(path).await {
+        Ok(file) => file,
+        Err(e) => return Err(Box::new(e)),
+    };
+
+    let mut contents = String::new();
+    if let Err(e) = file.read_to_string(&mut contents).await {
+        return Err(Box::new(e));
+    }
+
+    match serde_json::from_str(&contents) {
+        Ok(recipes) => Ok(recipes),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+async fn write_local_recipes(recipes: &Recipes) -> Result<()> {
+    let path = STORAGE_FILE_PATH; // Ensure this path is set to your 'recipes.json' file
+    let temp_path = format!("{}.tmp", path);
+
+    let json = match serde_json::to_string(&recipes) {
+        Ok(json) => json,
+        Err(e) => return Err(Box::new(e)),
+    };
+
+    let mut file = match File::create(&temp_path).await {
+        Ok(file) => file,
+        Err(e) => return Err(Box::new(e)),
+    };
+
+    if let Err(e) = file.write(json.as_bytes()).await {
+        return Err(Box::new(e));
+    }
+
+    // Ensure data is flushed and file is synced to disk
+    if let Err(e) = file.sync_all().await {
+        return Err(Box::new(e));
+    }
+
+    // Rename temp file to permanent file path
+    match tokio::fs::rename(&temp_path, path).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+
+
 impl NetworkBehaviourEventProcess<FloodsubEvent> for RecipeBehaviour {
     fn inject_event(&mut self, event: FloodsubEvent) {
         match event {
-            FloodsubEvent::Message(msg) => {
-                if let Ok(resp) = serde_json::from_slice::<ListResponse>(&msg.data) {
-                    if resp.receiver == PEER_ID.to_string() {
-                        info!("Response from {}:", msg.source);
-                        resp.data.iter().for_each(|r| info!("{:?}", r));
-                    }
-                } else if let Ok(req) = serde_json::from_slice::<ListRequest>(&msg.data) {
-                    match req.mode {
+            FloodsubEvent::Message(message) => {
+                if let Ok(request) = serde_json::from_slice::<ListRequest>(&message.data) {
+                    match request.mode {
                         ListMode::ALL => {
-                            info!("Received ALL req: {:?} from {:?}", req, msg.source);
-                            respond_with_public_recipes(
-                                self.response_sender.clone(),
-                                msg.source.to_string(),
-                            );
-                        }
-                        ListMode::One(ref peer_id) => {
-                            if peer_id == &PEER_ID.to_string() {
-                                info!("Received req: {:?} from {:?}", req, msg.source);
-                                respond_with_public_recipes(
-                                    self.response_sender.clone(),
-                                    msg.source.to_string(),
-                                );
+                            info!("Received list all recipes request from {}", message.source);
+                            tokio::spawn(async move {
+                                let recipes = match read_local_recipes().await {
+                                    Ok(recipes) => recipes,
+                                    Err(_) => vec![],
+                                };
+                                let response = ListResponse {
+                                    mode: ListMode::ALL,
+                                    data: recipes,
+                                    receiver: message.source.to_string(),
+                                };
+                                let _response_json = serde_json::to_string(&response).unwrap();
+                            });
+                        },
+                        ListMode::One(peer_id) => {
+                            if &peer_id == &PEER_ID.to_string() {
+                                info!("Received specific list request from {}", message.source);
                             }
-                        }
+                        },
                     }
                 }
-            }
+            },
             _ => (),
         }
     }
 }
 
-fn respond_with_public_recipes(sender: mpsc::UnboundedSender<ListResponse>, receiver: String) {
-    tokio::spawn(async move {
-        match read_local_recipes().await {
-            Ok(recipes) => {
-                let resp = ListResponse {
-                    mode: ListMode::ALL,
-                    receiver,
-                    data: recipes.into_iter().filter(|r| r.public).collect(),
-                };
-                if let Err(e) = sender.send(resp) {
-                    error!("error sending response via channel, {}", e);
-                }
-            }
-            Err(e) => error!("error fetching local recipes to answer ALL request, {}", e),
-        }
-    });
-}
-
 impl NetworkBehaviourEventProcess<MdnsEvent> for RecipeBehaviour {
     fn inject_event(&mut self, event: MdnsEvent) {
         match event {
-            MdnsEvent::Discovered(discovered_list) => {
-                for (peer, _addr) in discovered_list {
-                    self.floodsub.add_node_to_partial_view(peer);
+            MdnsEvent::Discovered(peers) => {
+                for (peer_id, _addr) in peers {
+                    info!("Discovered new peer: {:?}", peer_id);
+                    self.floodsub.add_node_to_partial_view(peer_id);
+                }
+            },
+            MdnsEvent::Expired(peers) => {
+                for (peer_id, _addr) in peers {
+                    info!("Peer expired: {:?}", peer_id);
+                    self.floodsub.remove_node_from_partial_view(&peer_id);
                 }
             }
-            MdnsEvent::Expired(expired_list) => {
-                for (peer, _addr) in expired_list {
-                    if !self.mdns.has_node(&peer) {
-                        self.floodsub.remove_node_from_partial_view(&peer);
+        }
+    }
+}
+
+async fn add_new_recipe(recipe: Recipe) -> Result<()> {
+    let mut recipes = read_local_recipes().await?;
+    recipes.push(recipe);
+    write_local_recipes(&recipes).await?;
+    Ok(())
+}
+
+async fn publish_recipe(recipe_id: usize) -> Result<()> {
+    let mut recipes = read_local_recipes().await?;
+    if let Some(recipe) = recipes.iter_mut().find(|r| r.id == recipe_id) {
+        recipe.public = true;
+        write_local_recipes(&recipes).await?;
+        Ok(())
+    } else {
+        Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "Recipe not found")))
+    }
+}
+
+async fn fetch_public_recipes() -> Result<Recipes> {
+    let recipes = read_local_recipes().await?;
+    Ok(recipes.into_iter().filter(|r| r.public).collect())
+}
+
+// // Function to serialize peer ids
+// fn serialize_peer_ids(peers: Vec<PeerId>) -> Vec<String> {
+//     peers.into_iter()
+//         .map(|peer_id| peer_id.to_base58())
+//         .collect()
+// }
+
+
+async fn handle_websocket_connection(raw_stream: TcpStream) {
+    let ws_stream = accept_async(raw_stream).await.expect("Failed to accept WebSocket connection");
+    let (mut write, mut read) = ws_stream.split();
+
+    while let Some(message) = read.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                info!("Received message via WebSocket: {}", text);
+                let parts: Vec<&str> = text.split_whitespace().collect();
+                match parts[0] {
+                    "ls" => match parts[1] {
+                        "r" if parts[2] == "all" => {
+                            let recipes = fetch_public_recipes().await.unwrap_or_else(|_| vec![]);
+                            let response = serde_json::to_string(&recipes).unwrap();
+                            let send_message = Message::Text(response);
+                            write.send(send_message).await.expect("Failed to send message");
+                        },
+                        _ => {},
+                    },
+                    "publish" if parts[1] == "r" => {
+                        let id = parts[2].parse::<usize>().unwrap();
+                        if let Ok(_) = publish_recipe(id).await {
+                            let mut data = HashMap::new();
+                            data.insert("status", "Recipe published");
+                            let response = serde_json::to_string(&data).unwrap();
+                            let send_message = Message::Text(response);
+                            write.send(send_message).await.expect("Failed to send message");
+                        }
+                    },
+                    "ls" if parts[1] == "p" => {
+                        // Placeholder for actual peer listing function
+                        // This function needs to be asynchronous and capable of being awaited
+                        // let peer_list = list_active_peers(&mut swarm).await?;
+                        // let response = serde_json::to_string(&peer_list).unwrap();
+                        // let send_message = Message::Text(response);
+                        // write.send(send_message).await.expect("Failed to send message");
+                    },
+                    "create" if parts[1] == "r" => {
+                        let data: Vec<&str> = parts[2].split('|').collect();
+                        if data.len() == 3 {
+                            let recipe = Recipe {
+                                id: 0, // ID will be generated
+                                name: data[0].to_string(),
+                                ingredients: data[1].to_string(),
+                                instructions: data[2].to_string(),
+                                public: false,
+                            };
+                            if let Ok(_) = add_new_recipe(recipe).await {
+                                let mut data2 = HashMap::new();
+                                data2.insert("status", "Recipe created");
+                                let response = serde_json::to_string(&data2).unwrap();
+                                let send_message = Message::Text(response);
+                                write.send(send_message).await.expect("Failed to send message");
+                            }
+                        }
+                    },
+                    _ => {
+                        let mut data3 = HashMap::new();
+                        data3.insert("error", "Invalid command");
+                        let error_message = serde_json::to_string(&data3).unwrap();
+                        let send_message = Message::Text(error_message);
+                        write.send(send_message).await.expect("Failed to send message");
                     }
                 }
             }
+            Ok(_) => {},
+            Err(e) => {
+                error!("WebSocket error: {:?}", e);
+                break;
+            }
         }
     }
-}
-
-async fn create_new_recipe(name: &str, ingredients: &str, instructions: &str) -> Result<()> {
-    let mut local_recipes = read_local_recipes().await?;
-    let new_id = match local_recipes.iter().max_by_key(|r| r.id) {
-        Some(v) => v.id + 1,
-        None => 0,
-    };
-    local_recipes.push(Recipe {
-        id: new_id,
-        name: name.to_owned(),
-        ingredients: ingredients.to_owned(),
-        instructions: instructions.to_owned(),
-        public: false,
-    });
-    write_local_recipes(&local_recipes).await?;
-
-    info!("Created recipe:");
-    info!("Name: {}", name);
-    info!("Ingredients: {}", ingredients);
-    info!("Instructions:: {}", instructions);
-
-    Ok(())
-}
-
-async fn publish_recipe(id: usize) -> Result<()> {
-    let mut local_recipes = read_local_recipes().await?;
-    local_recipes
-        .iter_mut()
-        .filter(|r| r.id == id)
-        .for_each(|r| r.public = true);
-    write_local_recipes(&local_recipes).await?;
-    Ok(())
-}
-
-async fn read_local_recipes() -> Result<Recipes> {
-    let content = fs::read(STORAGE_FILE_PATH).await?;
-    let result = serde_json::from_slice(&content)?;
-    Ok(result)
-}
-
-async fn write_local_recipes(recipes: &Recipes) -> Result<()> {
-    let json = serde_json::to_string(&recipes)?;
-    fs::write(STORAGE_FILE_PATH, &json).await?;
-    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     pretty_env_logger::init();
 
-    info!("Peer Id: {}", PEER_ID.clone());
-    let (response_sender, mut response_rcv) = mpsc::unbounded_channel();
+    // Obtain port from command line arguments, default to 9000 if not provided
+    let args: Vec<String> = env::args().collect();
+    let port = args.get(1).unwrap_or(&"9000".to_string()).parse::<u16>().unwrap_or(9000);
+    
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(&addr).await?;
+    info!("Server is listening on {}", addr);
 
-    let auth_keys = Keypair::<X25519Spec>::new()
-        .into_authentic(&KEYS)
-        .expect("can create auth keys");
+    let (response_sender, _response_rcv) = mpsc::unbounded_channel();
 
+    let auth_keys = NoiseKeypair::<X25519Spec>::new().into_authentic(&KEYS)?;
     let transp = TokioTcpConfig::new()
         .upgrade(upgrade::Version::V1)
-        .authenticate(NoiseConfig::xx(auth_keys).into_authenticated()) // XX Handshake pattern, IX exists as well and IK - only XX currently provides interop with other libp2p impls
+        .authenticate(NoiseConfig::xx(auth_keys).into_authenticated())
         .multiplex(mplex::MplexConfig::new())
         .boxed();
 
-    let mut behaviour = RecipeBehaviour {
+    let behaviour = RecipeBehaviour {
         floodsub: Floodsub::new(PEER_ID.clone()),
-        mdns: Mdns::new(Default::default())
-            .await
-            .expect("can create mdns"),
+        mdns: Mdns::new(Default::default()).await?,
         response_sender,
     };
 
-    behaviour.floodsub.subscribe(TOPIC.clone());
-
-    let mut swarm = SwarmBuilder::new(transp, behaviour, PEER_ID.clone())
-        .executor(Box::new(|fut| {
-            tokio::spawn(fut);
-        }))
-        .build();
-
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-
-    Swarm::listen_on(
-        &mut swarm,
-        "/ip4/0.0.0.0/tcp/0"
-            .parse()
-            .expect("can get a local socket"),
-    )
-    .expect("swarm can be started");
+    let mut swarm = SwarmBuilder::new(transp, behaviour, PEER_ID.clone()).build();
+    Swarm::listen_on(&mut swarm, "/ip4/0.0.0.0/tcp/0".parse()?)?;
 
     loop {
-        let evt = {
-            tokio::select! {
-                line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
-                response = response_rcv.recv() => Some(EventType::Response(response.expect("response exists"))),
-                event = swarm.select_next_some() => {
-                    info!("Unhandled Swarm Event: {:?}", event);
-                    None
-                },
-            }
-        };
-
-        if let Some(event) = evt {
-            match event {
-                EventType::Response(resp) => {
-                    let json = serde_json::to_string(&resp).expect("can jsonify response");
-                    swarm
-                        .behaviour_mut()
-                        .floodsub
-                        .publish(TOPIC.clone(), json.as_bytes());
-                }
-                EventType::Input(line) => match line.as_str() {
-                    "ls p" => handle_list_peers(&mut swarm).await,
-                    cmd if cmd.starts_with("ls r") => handle_list_recipes(cmd, &mut swarm).await,
-                    cmd if cmd.starts_with("create r") => handle_create_recipe(cmd).await,
-                    cmd if cmd.starts_with("publish r") => handle_publish_recipe(cmd).await,
-                    _ => error!("unknown command"),
-                },
-            }
+        select! {
+            conn = listener.accept() => {
+                let (stream, _) = conn?;
+                tokio::spawn(handle_websocket_connection(stream));
+            },
+            event = swarm.select_next_some() => {
+                info!("Unhandled Swarm Event: {:?}", event);
+            },
+            _ = signal::ctrl_c() => {
+                info!("CTRL-C received, shutting down");
+                break;
+            },
         }
     }
-}
 
-async fn handle_list_peers(swarm: &mut Swarm<RecipeBehaviour>) {
-    info!("Discovered Peers:");
-    let nodes = swarm.behaviour().mdns.discovered_nodes();
-    let mut unique_peers = HashSet::new();
-    for peer in nodes {
-        unique_peers.insert(peer);
-    }
-    unique_peers.iter().for_each(|p| info!("{}", p));
-}
-
-async fn handle_list_recipes(cmd: &str, swarm: &mut Swarm<RecipeBehaviour>) {
-    let rest = cmd.strip_prefix("ls r ");
-    match rest {
-        Some("all") => {
-            let req = ListRequest {
-                mode: ListMode::ALL,
-            };
-            let json = serde_json::to_string(&req).expect("can jsonify request");
-            swarm
-                .behaviour_mut()
-                .floodsub
-                .publish(TOPIC.clone(), json.as_bytes());
-        }
-        Some(recipes_peer_id) => {
-            let req = ListRequest {
-                mode: ListMode::One(recipes_peer_id.to_owned()),
-            };
-            let json = serde_json::to_string(&req).expect("can jsonify request");
-            swarm
-                .behaviour_mut()
-                .floodsub
-                .publish(TOPIC.clone(), json.as_bytes());
-        }
-        None => {
-            match read_local_recipes().await {
-                Ok(v) => {
-                    info!("Local Recipes ({})", v.len());
-                    v.iter().for_each(|r| info!("{:?}", r));
-                }
-                Err(e) => error!("error fetching local recipes: {}", e),
-            };
-        }
-    };
-}
-
-async fn handle_create_recipe(cmd: &str) {
-    if let Some(rest) = cmd.strip_prefix("create r") {
-        let elements: Vec<&str> = rest.split("|").collect();
-        if elements.len() < 3 {
-            info!("too few arguments - Format: name|ingredients|instructions");
-        } else {
-            let name = elements.get(0).expect("name is there");
-            let ingredients = elements.get(1).expect("ingredients is there");
-            let instructions = elements.get(2).expect("instructions is there");
-            if let Err(e) = create_new_recipe(name, ingredients, instructions).await {
-                error!("error creating recipe: {}", e);
-            };
-        }
-    }
-}
-
-async fn handle_publish_recipe(cmd: &str) {
-    if let Some(rest) = cmd.strip_prefix("publish r") {
-        match rest.trim().parse::<usize>() {
-            Ok(id) => {
-                if let Err(e) = publish_recipe(id).await {
-                    info!("error publishing recipe with id {}, {}", id, e)
-                } else {
-                    info!("Published Recipe with id: {}", id);
-                }
-            }
-            Err(e) => error!("invalid id: {}, {}", rest.trim(), e),
-        };
-    }
+    Ok(())
 }
